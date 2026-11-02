@@ -1,0 +1,185 @@
+// Ejecuta Python (Pyodide) en un hilo aparte para que la página no se bloquee.
+// Los paquetes (.whl/.zip) se publican con la extensión .wasm añadida: aquí se reescriben las peticiones.
+const paso = (t) => self.postMessage({ kind: "paso", data: t });
+paso("hilo de Python creado");
+const _fetch = self.fetch.bind(self);
+if (typeof importScripts === "function" && typeof document === "undefined") self.fetch = (u, o) => {
+  let s = (u instanceof Request) ? u.url : String(u);
+  if (/\.(whl|zip)$/.test(s)) s += ".wasm";
+  const corto = s.split("/").pop();
+  return _fetch(s, o).then((r) => { paso("descarga " + corto + ": " + r.status); return r; },
+                             (e) => { paso("descarga " + corto + ": ERROR " + e); throw e; });
+};
+
+let py = null;
+self.addEventListener('unhandledrejection', (e) => self.postMessage({ kind: 'error', data: 'Error interno: ' + (e.reason && (e.reason.stack || e.reason.message) || e.reason) }));
+self.addEventListener('error', (e) => self.postMessage({ kind: 'paso', data: 'ERROR no capturado: ' + (e.message || "") + ' ' + (e.filename || "") + ':' + (e.lineno || "") + ' ' + (e.error && e.error.stack || "") }));
+const post = (kind, data) => self.postMessage({ kind, data });
+self.pyPost = (kind, data) => post(kind, data && data.toJs ? data.toJs({ dict_converter: Object.fromEntries }) : data);
+
+const HARNESS = String.raw`
+import sys, os, io, time, base64, json, builtins, traceback
+from js import pyPost
+
+RAIZ = "/home/pyodide/curso"
+_ns_cuaderno = {}
+
+def _png(fig, dpi):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi)
+    return base64.b64encode(buf.getvalue()).decode()
+
+_mpl = {"listo": False}
+_estado = {"ultimo": 0.0, "frames": 0, "pausas": 0, "slots": {}}
+
+def _slot(fig):
+    k = id(fig)
+    if k not in _estado["slots"]:
+        _estado["slots"][k] = len(_estado["slots"])
+    return _estado["slots"][k]
+
+def _prepara_mpl():
+    if _mpl["listo"]:
+        return
+    os.environ["MPLBACKEND"] = "Agg"
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    def show(*a, **k):
+        for n in plt.get_fignums():
+            f = plt.figure(n)
+            pyPost("figura", json.dumps({"slot": _slot(f), "png": _png(f, 110)}))
+        plt.close("all")
+        _estado["slots"].clear()
+    def pause(t=0):
+        ahora = time.time()
+        _estado["pausas"] += 1
+        toca = (_estado["frames"] < 80 and _estado["pausas"] % 4 == 1) or (ahora - _estado["ultimo"] >= 0.5 and _estado["frames"] < 300)
+        if toca:
+            _estado["ultimo"] = ahora
+            for n in plt.get_fignums():
+                f = plt.figure(n)
+                pyPost("fotograma", json.dumps({"slot": _slot(f), "png": _png(f, 80)}))
+                _estado["frames"] += 1
+    plt.show = show
+    plt.pause = pause
+    plt.ion = lambda: None
+    plt.ioff = lambda: None
+    _mpl["listo"] = True
+
+def _limpia_modulos():
+    for nombre, m in list(sys.modules.items()):
+        f = getattr(m, "__file__", None) or ""
+        if f.startswith(RAIZ):
+            del sys.modules[nombre]
+
+def ejecuta(carpeta, fichero, codigo, cuaderno=False):
+    d = os.path.join(RAIZ, carpeta)
+    os.makedirs(d, exist_ok=True)
+    if fichero:
+        with open(os.path.join(d, fichero), "w", encoding="utf8") as fh:
+            fh.write(codigo)
+    os.chdir(d)
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    for otro in [p for p in sys.path if p.startswith(RAIZ) and p != d]:
+        sys.path.remove(otro)
+    _limpia_modulos()
+    _estado["frames"] = 0
+    _estado["pausas"] = 0
+    _estado["ultimo"] = 0.0
+    if "matplotlib" in sys.modules or "matplotlib" in codigo or any(
+            "matplotlib" in open(os.path.join(d, x), encoding="utf8").read()
+            for x in os.listdir(d) if x.endswith(".py")):
+        _prepara_mpl()
+    if cuaderno:
+        ns = _ns_cuaderno.setdefault(carpeta, {"__name__": "__main__"})
+    else:
+        ns = {"__name__": "__main__", "__file__": os.path.join(d, fichero or "programa.py")}
+    t0 = time.time()
+    ok = True
+    try:
+        exec(compile(codigo, fichero or "celda", "exec"), ns)
+    except SystemExit:
+        pass
+    except BaseException:
+        ok = False
+        tb = traceback.format_exc()
+        # quitar las líneas internas de la aplicación
+        lineas = [l for l in tb.splitlines() if "<exec>" not in l]
+        pyPost("error", "\n".join(lineas))
+    if "matplotlib.pyplot" in sys.modules:
+        import matplotlib.pyplot as plt
+        if plt.get_fignums():
+            plt.show()
+    return json.dumps({"ok": ok, "t": time.time() - t0})
+
+def reinicia_cuaderno(carpeta):
+    _ns_cuaderno.pop(carpeta, None)
+`;
+
+async function init(base) {
+  if (typeof loadPyodide === "undefined") importScripts(base + "pyodide/pyodide.js");
+  paso("pyodide.js cargado");
+  py = await loadPyodide({ indexURL: base + "pyodide/" });
+  paso("Python arrancado");
+  py.setStdout({ batched: (s) => post("stdout", s + "\n") });
+  py.setStderr({ batched: (s) => post("stderr", s + "\n") });
+  await py.loadPackage(["numpy"], { messageCallback: () => {} });
+  paso("numpy cargado");
+  py.runPython(HARNESS);
+}
+
+async function writeFiles(folders) {
+  const FS = py.FS;
+  const mk = (p) => { try { FS.mkdirTree(p); } catch (e) {} };
+  for (const [carpeta, files] of Object.entries(folders)) {
+    mk("/home/pyodide/curso/" + carpeta);
+    for (const [nombre, txt] of Object.entries(files)) {
+      FS.writeFile("/home/pyodide/curso/" + carpeta + "/" + nombre, txt);
+    }
+  }
+}
+
+async function cargaPaquetes(codigo, carpeta) {
+  // los imports del programa y de los módulos de su carpeta
+  let todo = codigo;
+  try {
+    const d = "/home/pyodide/curso/" + carpeta;
+    for (const f of py.FS.readdir(d)) if (f.endsWith(".py")) todo += "\n" + py.FS.readFile(d + "/" + f, { encoding: "utf8" });
+  } catch (e) {}
+  const nuevos = [];
+  await py.loadPackagesFromImports(todo, {
+    messageCallback: (m) => { const r = /Loading (.*)/.exec(m); if (r) nuevos.push(r[1]); },
+  });
+  return nuevos;
+}
+
+self.onmessage = async (e) => {
+  const m = e.data;
+  try {
+    if (m.type === "init") {
+      const t0 = performance.now();
+      await init(m.base);
+      await writeFiles(m.folders);
+      post("listo", { t: (performance.now() - t0) / 1000 });
+    } else if (m.type === "run") {
+      if (m.files) await writeFiles({ [m.folder]: m.files });
+      post("estado", "Cargando las bibliotecas…");
+      await cargaPaquetes(m.code, m.folder);
+      post("estado", "Ejecutando…");
+      const ejecuta = py.globals.get(m.notebook ? "ejecuta" : "ejecuta");
+      const r = JSON.parse(ejecuta(m.folder, m.file || null, m.code, !!m.notebook));
+      ejecuta.destroy();
+      post("fin", r);
+    } else if (m.type === "reset-nb") {
+      py.globals.get("reinicia_cuaderno")(m.folder);
+      post("fin", { ok: true, t: 0, reset: true });
+    }
+  } catch (err) {
+    paso("ERROR: " + (err && (err.stack || err.message) || err));
+    if (m.type === "init") { post("fallo-init", String(err && err.message || err)); return; }
+    post("error", String(err && err.message || err));
+    post("fin", { ok: false, t: 0 });
+  }
+};
